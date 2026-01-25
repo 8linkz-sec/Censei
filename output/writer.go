@@ -13,12 +13,6 @@ import (
 	"censei/logging"
 )
 
-// BinaryFinding represents a binary file finding with its URL and Content-Type
-type BinaryFinding struct {
-	URL         string
-	ContentType string
-}
-
 // Writer handles output file operations with buffered I/O for performance
 type Writer struct {
 	rawFile      *os.File
@@ -30,8 +24,9 @@ type Writer struct {
 	mu           sync.Mutex
 	logger       *logging.Logger
 
-	// Collect binary findings grouped by host for sorted output
-	binaryFindings map[string][]BinaryFinding // host -> list of findings
+	// Track seen binary URLs for deduplication (immediate write to file)
+	seenBinaryURLs map[string]bool
+	binaryFilePath string // path to binary_found.txt for post-scan sorting
 }
 
 // NewWriter creates a new output writer
@@ -80,7 +75,8 @@ func NewWriter(outputDir string, logger *logging.Logger) (*Writer, error) {
 		filteredWriter: bufio.NewWriterSize(filteredFile, bufferSize),
 		binaryWriter:   bufio.NewWriterSize(binaryFile, bufferSize),
 		logger:         logger,
-		binaryFindings: make(map[string][]BinaryFinding),
+		seenBinaryURLs: make(map[string]bool),
+		binaryFilePath: binaryPath,
 	}, nil
 }
 
@@ -112,13 +108,13 @@ func (w *Writer) WriteFilteredOutput(line string) error {
 	return nil
 }
 
-// WriteBinaryOutput collects binary findings grouped by host for sorted output
+// WriteBinaryOutput writes binary findings immediately to file (one URL per line)
 // Expected line format: "URL with Content-Type: CONTENT_TYPE"
 func (w *Writer) WriteBinaryOutput(line string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Parse the line to extract URL and Content-Type
+	// Parse the line to extract URL
 	// Format: "http://example.com/file.exe with Content-Type: application/x-msdownload"
 	parts := strings.Split(line, " with Content-Type: ")
 	if len(parts) != 2 {
@@ -127,69 +123,116 @@ func (w *Writer) WriteBinaryOutput(line string) error {
 	}
 
 	fileURL := strings.TrimSpace(parts[0])
-	contentType := strings.TrimSpace(parts[1])
 
-	// Extract host from URL
-	parsedURL, err := url.Parse(fileURL)
+	// Check for duplicates
+	if w.seenBinaryURLs[fileURL] {
+		return nil
+	}
+	w.seenBinaryURLs[fileURL] = true
+
+	// Write immediately to file
+	_, err := fmt.Fprintln(w.binaryWriter, fileURL)
 	if err != nil {
-		w.logger.Error("Failed to parse URL %s: %v", fileURL, err)
+		w.logger.Error("Failed to write to binary output: %v", err)
 		return err
 	}
 
-	host := parsedURL.Scheme + "://" + parsedURL.Host
-
-	// Check if this URL already exists for this host to avoid duplicates
-	for _, existing := range w.binaryFindings[host] {
-		if existing.URL == fileURL {
-			// URL already recorded, skip duplicate
-			return nil
-		}
+	// Flush immediately to ensure data is written to disk
+	// This ensures data is not lost on abort
+	if err := w.binaryWriter.Flush(); err != nil {
+		w.logger.Error("Failed to flush binary output: %v", err)
+		return err
 	}
-
-	// Add finding to the map
-	w.binaryFindings[host] = append(w.binaryFindings[host], BinaryFinding{
-		URL:         fileURL,
-		ContentType: contentType,
-	})
 
 	return nil
 }
 
-// writeSortedBinaryFindings writes all binary findings grouped by host in sorted order
-func (w *Writer) writeSortedBinaryFindings() error {
-	if len(w.binaryFindings) == 0 {
+// SortAndGroupBinaryFile reads the binary_found.txt file, groups URLs by host,
+// sorts them alphabetically, and overwrites the file with the grouped format.
+// This should be called after a successful scan completion.
+func (w *Writer) SortAndGroupBinaryFile() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// First flush the buffer to ensure all data is written
+	if w.binaryWriter != nil {
+		if err := w.binaryWriter.Flush(); err != nil {
+			return fmt.Errorf("failed to flush binary buffer: %w", err)
+		}
+	}
+
+	// Read the file
+	data, err := os.ReadFile(w.binaryFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to read binary file: %w", err)
+	}
+
+	// Parse URLs and group by host
+	lines := strings.Split(string(data), "\n")
+	hostFindings := make(map[string][]string) // host -> list of URLs
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Extract host from URL
+		parsedURL, err := url.Parse(line)
+		if err != nil {
+			w.logger.Error("Failed to parse URL during sorting: %s", line)
+			continue
+		}
+
+		host := parsedURL.Scheme + "://" + parsedURL.Host
+		hostFindings[host] = append(hostFindings[host], line)
+	}
+
+	if len(hostFindings) == 0 {
 		return nil
 	}
 
 	// Sort hosts alphabetically
-	hosts := make([]string, 0, len(w.binaryFindings))
-	for host := range w.binaryFindings {
+	hosts := make([]string, 0, len(hostFindings))
+	for host := range hostFindings {
 		hosts = append(hosts, host)
 	}
 	sort.Strings(hosts)
 
-	// Write findings grouped by host
+	// Rewrite the file with grouped format
+	file, err := os.Create(w.binaryFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to recreate binary file: %w", err)
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+
 	for _, host := range hosts {
-		findings := w.binaryFindings[host]
-		if len(findings) == 0 {
+		urls := hostFindings[host]
+		if len(urls) == 0 {
 			continue
 		}
 
 		// Write host separator
-		separator := fmt.Sprintf("\n=== %s (%d files) ===\n", host, len(findings))
-		if _, err := w.binaryWriter.WriteString(separator); err != nil {
+		separator := fmt.Sprintf("\n=== %s (%d files) ===\n", host, len(urls))
+		if _, err := writer.WriteString(separator); err != nil {
 			return fmt.Errorf("failed to write host separator: %w", err)
 		}
 
-		// Write all findings for this host (URLs only for easy copying)
-		for _, finding := range findings {
-			line := fmt.Sprintf("%s\n", finding.URL)
-			if _, err := w.binaryWriter.WriteString(line); err != nil {
-				return fmt.Errorf("failed to write binary finding: %w", err)
+		// Write all URLs for this host
+		for _, fileURL := range urls {
+			if _, err := fmt.Fprintln(writer, fileURL); err != nil {
+				return fmt.Errorf("failed to write URL: %w", err)
 			}
 		}
 	}
 
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush sorted output: %w", err)
+	}
+
+	w.logger.Info("Binary findings sorted and grouped by %d hosts", len(hosts))
 	return nil
 }
 
@@ -220,21 +263,11 @@ func (w *Writer) Close() error {
 		w.filteredWriter = nil
 	}
 
-	// Write sorted binary findings before flushing
+	// Flush binary buffer (sorting happens separately via SortAndGroupBinaryFile)
 	if w.binaryWriter != nil {
-		w.logger.Info("Writing %d binary findings grouped by host", len(w.binaryFindings))
-		binaryFlushErr = w.writeSortedBinaryFindings()
+		binaryFlushErr = w.binaryWriter.Flush()
 		if binaryFlushErr != nil {
-			w.logger.Error("Failed to write sorted binary findings: %v", binaryFlushErr)
-		}
-
-		// Now flush the buffer
-		flushErr := w.binaryWriter.Flush()
-		if flushErr != nil {
-			w.logger.Error("Failed to flush binary output buffer: %v", flushErr)
-			if binaryFlushErr == nil {
-				binaryFlushErr = flushErr
-			}
+			w.logger.Error("Failed to flush binary output buffer: %v", binaryFlushErr)
 		}
 		w.binaryWriter = nil
 	}

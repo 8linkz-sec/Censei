@@ -270,31 +270,10 @@ func (w *Worker) processDirectoryContent(host api.Host, htmlContent string) {
 	recursive := w.queryConfig.Recursive == "yes"
 	maxDepth := w.queryConfig.MaxDepth
 
-	// Create skip callback function with block logic
-	skipCallback := func(hostURL string) {
-		baseHost := w.extractBaseHost(hostURL)
-		w.logger.Info("Skipping directory due to link limit: %s", hostURL)
-
-		// Increment skip counter for base host
-		skipCountPtr, _ := w.skipCounters.LoadOrStore(baseHost, new(int64))
-		newSkipCount := atomic.AddInt64(skipCountPtr.(*int64), 1)
-
-		w.logger.Debug("Skip count for base host %s: %d", baseHost, newSkipCount)
-
-		// Check if we should block entire base host
-		if w.config.MaxSkipsBeforeBlock > 0 && newSkipCount >= int64(w.config.MaxSkipsBeforeBlock) {
-			w.logger.Info("Blocking entire base host after %d skips: %s", newSkipCount, baseHost)
-			w.blockedHosts.Store(baseHost, true)
-			w.blocklist.AddHost(baseHost)
-
-			// Mark the original host URL as skipped (only after blocking threshold is reached)
-			w.skippedHosts.Store(host.URL, true)
-		}
-	}
-
 	if recursive && maxDepth > 1 {
 		w.logger.Info("Starting recursive scan with max-depth %d for %s", maxDepth, host.URL)
-		fileURLs = w.directoryScanner.ScanHostRecursive(host, htmlContent, maxDepth, w.client, w.config, skipCallback)
+		// Pass worker as HostTracker - implements RecordSkip and IsBlocked
+		fileURLs = w.directoryScanner.ScanHostRecursive(host, htmlContent, maxDepth, w.client, w.config, w)
 	} else {
 		w.logger.Info("Scanning directory listing: %s", host.URL)
 		fileURLs = w.directoryScanner.ScanHost(host, htmlContent)
@@ -419,4 +398,39 @@ func (w *Worker) extractBaseHost(fullURL string) string {
 
 	w.logger.Debug("Extracted base host: %s from URL: %s", hostname, fullURL)
 	return hostname
+}
+
+// RecordSkip implements scanners.HostTracker.RecordSkip
+// Records a skip/timeout event for a URL and blocks the host if threshold is reached
+func (w *Worker) RecordSkip(hostURL string) {
+	baseHost := w.extractBaseHost(hostURL)
+	w.logger.Debug("Skip triggered for: %s (base: %s)", hostURL, baseHost)
+
+	// Increment skip counter for base host
+	skipCountPtr, _ := w.skipCounters.LoadOrStore(baseHost, new(int64))
+	newSkipCount := atomic.AddInt64(skipCountPtr.(*int64), 1)
+
+	w.logger.Debug("Skip count for base host %s: %d", baseHost, newSkipCount)
+
+	// Check if we should block entire base host
+	if w.config.MaxSkipsBeforeBlock > 0 && newSkipCount >= int64(w.config.MaxSkipsBeforeBlock) {
+		w.logger.Info("Blocking entire base host after %d skips: %s", newSkipCount, baseHost)
+		w.blockedHosts.Store(baseHost, true)
+		w.blocklist.AddHost(baseHost)
+	}
+}
+
+// IsBlocked implements scanners.HostTracker.IsBlocked
+// Checks if a host is blocked (either in persistent blocklist or in-memory)
+func (w *Worker) IsBlocked(hostURL string) bool {
+	baseHost := w.extractBaseHost(hostURL)
+
+	// Check persistent blocklist
+	if w.blocklist.IsBlocked(baseHost) {
+		return true
+	}
+
+	// Check in-memory blocked hosts
+	_, isBlocked := w.blockedHosts.Load(baseHost)
+	return isBlocked
 }
