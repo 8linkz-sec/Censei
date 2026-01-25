@@ -351,6 +351,12 @@ func runQueryConfig(cfg *config.Config, queryConfig *config.Query, logger *loggi
 	// Process hosts
 	worker.ProcessHosts(hosts)
 
+	// Sort and group binary findings after successful scan
+	if err := writer.SortAndGroupBinaryFile(); err != nil {
+		logger.Error("Could not sort binary findings: %v", err)
+		// Not fatal - unsorted file is better than none
+	}
+
 	// Get updated statistics
 	stats.totalHosts, stats.onlineHosts, stats.totalFiles, stats.filteredFiles, stats.checkedFiles, stats.binaryFilesFound, stats.writeErrors = worker.GetStats()
 

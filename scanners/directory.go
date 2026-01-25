@@ -17,6 +17,12 @@ type HTTPClient interface {
 	CheckHostAndFetch(host api.Host) (bool, string, error)
 }
 
+// HostTracker tracks skip events and blocking status for hosts
+type HostTracker interface {
+	RecordSkip(url string)     // Registriert einen Skip/Timeout für die URL
+	IsBlocked(url string) bool // Prüft ob der Base-Host blockiert ist
+}
+
 // DirectoryScanner handles scanning of open directory listings
 type DirectoryScanner struct {
 	logger          *logging.Logger
@@ -43,7 +49,7 @@ func (ds *DirectoryScanner) ScanHost(host api.Host, htmlContent string) []string
 }
 
 // ScanHostRecursive performs recursive directory scanning with configurable limits
-func (ds *DirectoryScanner) ScanHostRecursive(host api.Host, htmlContent string, maxDepth int, client HTTPClient, cfg *config.Config, skipCallback func(string)) []string {
+func (ds *DirectoryScanner) ScanHostRecursive(host api.Host, htmlContent string, maxDepth int, client HTTPClient, cfg *config.Config, tracker HostTracker) []string {
 	if maxDepth <= 0 {
 		return ds.ScanHost(host, htmlContent)
 	}
@@ -51,19 +57,27 @@ func (ds *DirectoryScanner) ScanHostRecursive(host api.Host, htmlContent string,
 	atomic.StoreInt64(&ds.totalLinksCount, 0)
 	visited := make(map[string]bool)
 	allLinks := []string{}
-	ds.scanRecursive(host.URL, htmlContent, 0, maxDepth, visited, &allLinks, client, cfg, skipCallback)
+	ds.scanRecursive(host.URL, htmlContent, 0, maxDepth, visited, &allLinks, client, cfg, tracker)
 	return allLinks
 }
 
 // scanRecursive performs the actual recursive scanning
-func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDepth, maxDepth int, visited map[string]bool, allLinks *[]string, client HTTPClient, cfg *config.Config, skipCallback func(string)) {
+func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDepth, maxDepth int, visited map[string]bool, allLinks *[]string, client HTTPClient, cfg *config.Config, tracker HostTracker) {
+	// Check if host is already blocked before any processing
+	if tracker != nil && tracker.IsBlocked(baseURL) {
+		ds.logger.Debug("Host blocked, skipping recursion for: %s", baseURL)
+		return
+	}
+
 	// Check total links limit with thread-safe counter
 	currentCount := atomic.LoadInt64(&ds.totalLinksCount)
 	ds.logger.Debug("Recursion check: current count=%d, limit=%d, depth=%d, URL=%s", currentCount, cfg.MaxTotalLinks, currentDepth, baseURL)
 
 	if cfg.MaxTotalLinks > 0 && int(currentCount) > cfg.MaxTotalLinks {
 		ds.logger.Info("Host reached maximum total links (%d >= %d), marking for skip", currentCount, cfg.MaxTotalLinks)
-		skipCallback(baseURL) // NEU: Host als "voll" markieren
+		if tracker != nil {
+			tracker.RecordSkip(baseURL)
+		}
 		return
 	}
 
@@ -82,7 +96,9 @@ func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDe
 	}
 	if len(visited) >= maxVisited {
 		ds.logger.Info("Host reached maximum visited URLs (%d >= %d), stopping recursion to prevent memory exhaustion", len(visited), maxVisited)
-		skipCallback(baseURL)
+		if tracker != nil {
+			tracker.RecordSkip(baseURL)
+		}
 		return
 	}
 
@@ -127,6 +143,12 @@ func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDe
 	if currentDepth+1 < maxDepth {
 		ds.logger.Debug("Planning to recurse into %d directories", len(directories))
 		for i, dirURL := range directories {
+			// Check if host became blocked during iteration
+			if tracker != nil && tracker.IsBlocked(dirURL) {
+				ds.logger.Debug("Host blocked during recursion, stopping: %s", dirURL)
+				return
+			}
+
 			ds.logger.Debug("Recursing into directory %d/%d: %s", i+1, len(directories), dirURL)
 
 			// Create host object for directory
@@ -136,13 +158,23 @@ func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDe
 			online, dirContent, err := client.CheckHostAndFetch(dirHost)
 			if err != nil || !online {
 				ds.logger.Debug("Failed to fetch directory %s: %v", dirURL, err)
+				// Signal timeout/failure to worker - this will increment skip counter
+				// and eventually block the host after MaxSkipsBeforeBlock threshold
+				if tracker != nil {
+					tracker.RecordSkip(dirURL)
+					// Check if this skip caused the host to be blocked
+					if tracker.IsBlocked(dirURL) {
+						ds.logger.Debug("Host now blocked after skip, stopping recursion")
+						return
+					}
+				}
 				continue
 			}
 
 			// Check if it's a directory listing
 			if ds.IsDirectoryListing(dirContent) {
 				ds.logger.Debug("Directory confirmed, recursing: %s", dirURL)
-				ds.scanRecursive(dirURL, dirContent, currentDepth+1, maxDepth, visited, allLinks, client, cfg, skipCallback)
+				ds.scanRecursive(dirURL, dirContent, currentDepth+1, maxDepth, visited, allLinks, client, cfg, tracker)
 			} else {
 				ds.logger.Debug("Not a directory listing, skipping: %s", dirURL)
 			}
