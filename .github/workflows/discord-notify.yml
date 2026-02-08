@@ -1,0 +1,10 @@
+name: Discord Notify
+on:
+  pull_request:
+    types: [closed]
+jobs:
+  notify:
+    if: github.event.pull_request.merged == true
+    uses: DEINE-ORG/.github/.github/workflows/discord-merge-notify.yml@main
+    secrets:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
