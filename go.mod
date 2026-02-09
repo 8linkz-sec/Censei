@@ -4,7 +4,7 @@ go 1.24.2
 
 require (
 	github.com/PuerkitoBio/goquery v1.11.0
-	github.com/censys/censys-sdk-go v0.25.3
+	github.com/censys/censys-sdk-go v0.25.5
 )
 
 require (
