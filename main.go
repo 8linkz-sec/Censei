@@ -114,7 +114,9 @@ func main() {
 
 	// Apply log level from config
 	logger.SetLevel(cfg.LogLevel)
-	logger.SetOutputFile(cfg.LogFile)
+	if err := logger.SetOutputFile(cfg.LogFile); err != nil {
+		logger.Error("Failed to set log output file: %v", err)
+	}
 
 	// Initialize the application
 	logger.Info("Censei Scanner starting up...")
@@ -379,17 +381,17 @@ func runQueryConfig(cfg *config.Config, queryConfig *config.Query, logger *loggi
 	)
 
 	logger.Info("\n%s", summary)
-	writer.WriteRawOutput("\n" + summary)
+	_ = writer.WriteRawOutput("\n" + summary)
 
 	// Check for write errors and warn user
 	if stats.writeErrors > 0 {
-		warningMsg := fmt.Sprintf("\n⚠️  WARNING: %d file write errors occurred during execution!", stats.writeErrors)
+		warningMsg := fmt.Sprintf("\nWARNING: %d file write errors occurred during execution!", stats.writeErrors)
 		warningMsg += "\n   Some results may not have been saved to output files."
 		warningMsg += "\n   Check the logs above for details about which files failed."
 		warningMsg += "\n   Common causes: disk full, permission errors, or network issues."
 		logger.Error("%s", warningMsg)
 		// Don't fail on write error to raw output here - best effort
-		writer.WriteRawOutput(warningMsg)
+		_ = writer.WriteRawOutput(warningMsg)
 	}
 
 	logger.Info("Query execution complete")

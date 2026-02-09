@@ -80,7 +80,7 @@ func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
 
 	// Write to file if configured
 	if l.logFile != nil {
-		l.logFile.WriteString(logLine)
+		_, _ = l.logFile.WriteString(logLine)
 	}
 }
 
