@@ -1,0 +1,16 @@
+name: Security Scans
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  vulncheck:
+    uses: 8linkz-sec/.github/.github/workflows/govulncheck.yml@main
+    secrets:
+      DISCORD_VULN: ${{ secrets.DISCORD_VULN }}
+  codeql:
+    uses: 8linkz-sec/.github/.github/workflows/codeql.yml@main
+    secrets:
+      DISCORD_VULN: ${{ secrets.DISCORD_VULN }}
+    permissions:
+      security-events: write
