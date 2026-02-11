@@ -9,17 +9,19 @@ import (
 	"time"
 
 	"censei/api"
+	"censei/config"
 	"censei/logging"
 )
 
 // Client handles HTTP requests for crawling
 type Client struct {
-	httpClient *http.Client
-	logger     *logging.Logger
+	httpClient  *http.Client
+	logger      *logging.Logger
+	maxBodySize int64
 }
 
 // NewClient creates a new crawler client with optimized connection pooling
-func NewClient(timeoutSeconds int, logger *logging.Logger) *Client {
+func NewClient(timeoutSeconds int, logger *logging.Logger, cfg *config.Config) *Client {
 	// Create a custom transport with optimized settings
 	// These values are tuned for high-concurrency scanning with many workers
 	transport := &http.Transport{
@@ -53,9 +55,15 @@ func NewClient(timeoutSeconds int, logger *logging.Logger) *Client {
 		},
 	}
 
+	maxBody := int64(cfg.MaxBodySizeMB) << 20 // Convert MB to bytes
+	if maxBody <= 0 {
+		maxBody = 5 << 20 // 5 MB default
+	}
+
 	return &Client{
-		httpClient: client,
-		logger:     logger,
+		httpClient:  client,
+		logger:      logger,
+		maxBodySize: maxBody,
 	}
 }
 
@@ -90,16 +98,18 @@ func (c *Client) CheckHostAndFetch(host api.Host) (bool, string, error) {
 		return false, "", nil
 	}
 
-	// Read the response body with size limit to prevent memory exhaustion
-	// Limit to 50 MB to handle large directory listings with thousands of files
-	// Typical directory listings: 1-100 KB, large ones: 5-20 MB, extreme cases: up to 50 MB
-	const maxBodySize = 50 << 20 // 50 MB
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+	// Read the response body with configurable size limit to prevent memory exhaustion
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBodySize))
 	if err != nil {
 		// Timeout errors for large directories (e.g., /calls-old/) are common
 		// Log as debug and continue - the host is online, just slow to respond
 		c.logger.Debug("Failed to read response body for %s: %v (skipping)", host.URL, err)
 		return true, "", nil // Return empty body, but mark host as online
+	}
+
+	// Warn when body was truncated - later links in the listing will be missed
+	if int64(len(bodyBytes)) >= c.maxBodySize {
+		c.logger.Info("Response body truncated at %d MB for %s - some links may be missed", c.maxBodySize>>20, host.URL)
 	}
 
 	c.logger.Debug("Host online: %s (Status: %d, Content length: %d bytes)",

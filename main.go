@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"censei/api"
@@ -38,7 +39,7 @@ func checkCensysCLI(logger *logging.Logger) bool {
 
 func main() {
 	// Parse command line arguments
-	configPath := flag.String("config", "./config.json", "Path to config file")
+	configPath := flag.String("config", "./ressources/config.json", "Path to config file")
 	queriesPath := flag.String("queries", "", "Path to queries file (overrides default)")
 	filterStr := flag.String("filter", "", "Custom file extensions to filter (comma-separated, e.g. .pdf,.exe)")
 	queryStr := flag.String("query", "", "Run specific query directly")
@@ -71,7 +72,7 @@ func main() {
 		if cfg.QueriesFileLegacy != "" {
 			finalQueriesPath = cfg.QueriesFileLegacy
 		} else {
-			finalQueriesPath = "./legacy_queries.json"
+			finalQueriesPath = "./ressources/legacy_queries.json"
 		}
 		logger.Info("Legacy mode enabled - using %s", finalQueriesPath)
 	} else {
@@ -79,7 +80,7 @@ func main() {
 		if cfg.QueriesFileV3 != "" {
 			finalQueriesPath = cfg.QueriesFileV3
 		} else {
-			finalQueriesPath = "./queriesv3.json"
+			finalQueriesPath = "./ressources/queriesv3.json"
 		}
 		logger.Info("Platform API v3 mode - using %s", finalQueriesPath)
 	}
@@ -107,6 +108,7 @@ func main() {
 	// Override config with command line arguments if provided
 	if *outputPath != "" {
 		cfg.OutputDir = *outputPath
+		cfg.BinaryOutputFile = filepath.Join(*outputPath, "binary_found.txt")
 	}
 	if *logLevel != "" {
 		cfg.LogLevel = *logLevel
@@ -132,15 +134,15 @@ func main() {
 			fmt.Printf("\nERROR: Custom queries file '%s' not found or invalid.\n", *queriesPath)
 			fmt.Println("Please check the file path and ensure it contains valid JSON.")
 		} else if *legacyFlag {
-			// Legacy mode but legacy_queries.json is missing
-			fmt.Println("\nERROR: legacy_queries.json not found.")
+			// Legacy mode but queries file is missing
+			fmt.Printf("\nERROR: Queries file not found: %s\n", finalQueriesPath)
 			fmt.Println("Please create this file or use -queries to specify a custom queries file.")
 			fmt.Println("See README for query file examples.")
 		} else {
-			// Platform API mode but queriesv3.json is missing
-			fmt.Println("\nERROR: queriesv3.json not found.")
+			// Platform API mode but queries file is missing
+			fmt.Printf("\nERROR: Queries file not found: %s\n", finalQueriesPath)
 			fmt.Println("Please create this file or use -queries to specify a custom queries file.")
-			fmt.Println("For legacy CLI mode, use the -legacy flag with legacy_queries.json.")
+			fmt.Println("For legacy CLI mode, use the -legacy flag.")
 			fmt.Println("See README for query file examples.")
 		}
 
@@ -311,7 +313,7 @@ func runQueryConfig(cfg *config.Config, queryConfig *config.Query, logger *loggi
 	logger.Info("Extracted %d hosts from Censys results", len(hosts))
 
 	// Initialize output writer
-	writer, err := output.NewWriter(cfg.OutputDir, logger)
+	writer, err := output.NewWriter(cfg.OutputDir, cfg.BinaryOutputFile, logger)
 	if err != nil {
 		logger.Error("Failed to initialize output writer: %v", err)
 		os.Exit(1)
@@ -323,7 +325,7 @@ func runQueryConfig(cfg *config.Config, queryConfig *config.Query, logger *loggi
 	logger.Info("Using filters: %v", fileFilter.GetFilterExtensions())
 
 	// Initialize crawler components
-	client := crawler.NewClient(cfg.HTTPTimeoutSeconds, logger)
+	client := crawler.NewClient(cfg.HTTPTimeoutSeconds, logger, cfg)
 
 	// Initialize worker with query config
 	worker := crawler.NewWorker(

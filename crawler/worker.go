@@ -28,7 +28,6 @@ type Worker struct {
 	maxWorkers       int
 	checkEnabled     bool
 	targetFileName   string
-	skippedHosts     *sync.Map // Track hosts that hit limits
 	blockedHosts     *sync.Map // In-memory cache of blocked hosts
 	skipCounters     *sync.Map // Skip counters per base host
 	stats            *ScanStats
@@ -73,7 +72,6 @@ func NewWorker(
 		queryConfig:      queryConfig,
 		config:           config,
 		maxWorkers:       maxWorkers,
-		skippedHosts:     &sync.Map{},
 		blockedHosts:     &sync.Map{},
 		skipCounters:     &sync.Map{},
 		stats:            &ScanStats{},
@@ -139,8 +137,8 @@ func (w *Worker) processHost(host api.Host) {
 		w.logger.Info("Progress: %d/%d hosts processed", count, w.stats.totalHosts)
 	}
 
-	// Log the host we're processing - INFO level for user visibility
-	w.logger.Info("Processing host: %s", host.URL)
+	// Log individual host processing at Debug to reduce lock contention
+	w.logger.Debug("Processing host: %s", host.URL)
 
 	// Extract base host for blocking checks
 	baseHost := w.extractBaseHost(host.URL)
@@ -154,12 +152,6 @@ func (w *Worker) processHost(host api.Host) {
 	// Check if entire base host is blocked
 	if _, isBlocked := w.blockedHosts.Load(baseHost); isBlocked {
 		w.logger.Debug("Skipping host - base host is blocked: %s", host.URL)
-		return
-	}
-
-	// Check if this host should be skipped due to limits
-	if _, shouldSkip := w.skippedHosts.Load(host.URL); shouldSkip {
-		w.logger.Debug("Skipping host due to previous limit exceeded: %s", host.URL)
 		return
 	}
 
@@ -275,13 +267,13 @@ func (w *Worker) processDirectoryContent(host api.Host, htmlContent string) {
 		// Pass worker as HostTracker - implements RecordSkip and IsBlocked
 		fileURLs = w.directoryScanner.ScanHostRecursive(host, htmlContent, maxDepth, w.client, w.config, w)
 	} else {
-		w.logger.Info("Scanning directory listing: %s", host.URL)
-		fileURLs = w.directoryScanner.ScanHost(host, htmlContent)
+		w.logger.Debug("Scanning directory listing: %s", host.URL)
+		fileURLs = w.directoryScanner.ScanHost(host, htmlContent, w.config)
 	}
 
 	// Log found files for user visibility
 	if len(fileURLs) > 0 {
-		w.logger.Info("Found %d files at %s", len(fileURLs), host.URL)
+		w.logger.Debug("Found %d files at %s", len(fileURLs), host.URL)
 	}
 
 	// Process each found file with local deduplication map

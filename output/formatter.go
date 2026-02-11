@@ -60,7 +60,7 @@ func FormatSummary(
 			summary.WriteString(fmt.Sprintf("Binary files list: %s\n", binaryOutputFile))
 		}
 	} else {
-		summary.WriteString("Download enabled: No\n")
+		summary.WriteString("File check enabled: No\n")
 	}
 
 	summary.WriteString("===========================\n")

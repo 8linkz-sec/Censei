@@ -59,10 +59,9 @@ func (fc *FileChecker) Configure(enabled bool, targetFileName string) {
 	fc.targetFileName = targetFileName
 }
 
-// isBinaryContentType checks if a content type indicates binary content
-// Optimized helper to avoid code duplication and enable early exit
-func isBinaryContentType(contentType string) bool {
-	binaryTypes := []string{
+// binaryTypes lists content types that indicate binary/executable content.
+// Defined at package level to avoid re-allocation on every call.
+var binaryTypes = [...]string{
 		// Generic binary types
 		"application/octet-stream",
 		"application/binary",
@@ -152,14 +151,90 @@ func isBinaryContentType(contentType string) bool {
 		"application/x-jar",
 		"application/x-powershell",
 		"application/x-ms-powershell",
-	}
+}
 
+// isBinaryContentType checks if a content type indicates binary content
+func isBinaryContentType(contentType string) bool {
 	for _, binaryType := range binaryTypes {
 		if strings.Contains(contentType, binaryType) {
-			return true // Early exit on first match
+			return true
 		}
 	}
 	return false
+}
+
+// doHEADWithGETFallback performs a HEAD request and falls back to GET if the server
+// rejects HEAD (405/501) or blocks it (403). Returns the response, whether GET was used, and any error.
+// The caller is responsible for closing resp.Body.
+func (fc *FileChecker) doHEADWithGETFallback(fileURL string) (*http.Response, bool, error) {
+	req, err := http.NewRequest("HEAD", fileURL, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; CenseiBot/1.0)")
+	req.Header.Set("Accept", "*/*")
+
+	resp, err := fc.httpClient.Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to check file: %w", err)
+	}
+
+	// Fallback to GET for common HEAD-incompatible responses.
+	switch resp.StatusCode {
+	case http.StatusMethodNotAllowed, http.StatusNotImplemented, http.StatusForbidden:
+		resp.Body.Close()
+		fc.logger.Debug("HEAD returned %d for %s, falling back to GET", resp.StatusCode, fileURL)
+
+		getReq, err := http.NewRequest("GET", fileURL, nil)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to create GET fallback request: %w", err)
+		}
+		getReq.Header.Set("User-Agent", "Mozilla/5.0 (compatible; CenseiBot/1.0)")
+		getReq.Header.Set("Accept", "*/*")
+
+		resp, err = fc.httpClient.Do(getReq)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to check file (GET fallback): %w", err)
+		}
+		return resp, true, nil
+	}
+
+	return resp, false, nil
+}
+
+// checkBinaryContent validates the response and checks whether the content type is binary.
+// Returns (isBinary, contentType, error). Logs body-sniffing details when usedGETFallback is true.
+func (fc *FileChecker) checkBinaryContent(resp *http.Response, fileURL string, usedGETFallback bool) (bool, string, error) {
+	if resp.StatusCode != http.StatusOK {
+		return false, "", fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+
+	if resp.ContentLength == 0 {
+		return false, contentType, fmt.Errorf("file has zero size")
+	}
+
+	if isBinaryContentType(contentType) {
+		return true, contentType, nil
+	}
+
+	// Only attempt body sniffing in GET fallback mode.
+	if usedGETFallback {
+		buffer := make([]byte, 512)
+		n, err := io.ReadAtLeast(resp.Body, buffer, 1)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			n = 0
+		}
+		fc.logger.Debug("File found but not binary content: %s (Content-Type: %s, First bytes: %x)",
+			fileURL, contentType, buffer[:n])
+	} else {
+		fc.logger.Debug("File found but not binary content: %s (Content-Type: %s)",
+			fileURL, contentType)
+	}
+
+	return false, contentType, fmt.Errorf("file is not binary content")
 }
 
 // CheckSpecificFile checks if a specific file exists at the given URL
@@ -170,68 +245,32 @@ func (fc *FileChecker) CheckSpecificFile(baseURL, fileName string) (bool, string
 	}
 
 	// Validate fileName to prevent path traversal attacks
-	if strings.Contains(fileName, "..") || strings.Contains(fileName, "/") || strings.Contains(fileName, "\\") {
+	if strings.Contains(fileName, "..") {
 		return false, "", fmt.Errorf("invalid file name: contains path traversal characters")
 	}
+
+	// Normalize path separators and trim leading slashes
+	fileName = strings.ReplaceAll(fileName, "\\", "/")
+	fileName = strings.TrimPrefix(fileName, "/")
 
 	// Clean up the base URL
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
 	// Construct full URL
 	fileURL := fmt.Sprintf("%s/%s", baseURL, fileName)
-	fc.logger.Info("Checking for specific file: %s", fileURL)
+	fc.logger.Debug("Checking for specific file: %s", fileURL)
 
-	// Create the request
-	req, err := http.NewRequest("GET", fileURL, nil)
+	resp, usedGETFallback, err := fc.doHEADWithGETFallback(fileURL)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers to avoid detection/blocking
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; CenseiBot/1.0)")
-	req.Header.Set("Accept", "*/*")
-
-	// Execute the request
-	resp, err := fc.httpClient.Do(req)
-	if err != nil {
-		return false, "", fmt.Errorf("failed to check file: %w", err)
+		return false, "", err
 	}
 	defer resp.Body.Close()
 
-	// Check if the request was successful
-	if resp.StatusCode != http.StatusOK {
-		return false, "", fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
-	}
-
-	// Get content type
-	contentType := resp.Header.Get("Content-Type")
-
-	// Check content length
-	contentLength := resp.ContentLength
-	if contentLength == 0 {
-		return false, contentType, fmt.Errorf("file has zero size")
-	}
-
-	// Check for binary content types using optimized helper
-	isBinaryContent := isBinaryContentType(contentType)
-
-	// Read a small portion of the body to verify content type
-	// This helps avoid downloading the entire file
-	buffer := make([]byte, 512)
-	n, err := io.ReadAtLeast(resp.Body, buffer, 1)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		n = 0
-	}
-
-	// Log the result
-	if isBinaryContent {
+	isBinary, contentType, err := fc.checkBinaryContent(resp, fileURL, usedGETFallback)
+	if isBinary {
 		fc.logger.Info("Found '%s' at %s with Content-Type: %s", fileName, fileURL, contentType)
-		return true, contentType, nil
 	}
-
-	fc.logger.Debug("File found but not binary content: %s (Content-Type: %s, First bytes: %x)",
-		fileURL, contentType, buffer[:n])
-	return false, contentType, fmt.Errorf("file is not binary content")
+	return isBinary, contentType, err
 }
 
 // ShouldCheck determines if a file should be checked
@@ -259,47 +298,15 @@ func (fc *FileChecker) CheckFileURL(fileURL string) (bool, string, error) {
 
 	fc.logger.Debug("Checking file: %s", fileURL)
 
-	// Create the request
-	req, err := http.NewRequest("HEAD", fileURL, nil)
+	resp, usedGETFallback, err := fc.doHEADWithGETFallback(fileURL)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; CenseiBot/1.0)")
-	req.Header.Set("Accept", "*/*")
-
-	// Execute HEAD request first to check content type efficiently
-	resp, err := fc.httpClient.Do(req)
-	if err != nil {
-		return false, "", fmt.Errorf("failed to check file: %w", err)
+		return false, "", err
 	}
 	defer resp.Body.Close()
 
-	// Check if the request was successful
-	if resp.StatusCode != http.StatusOK {
-		return false, "", fmt.Errorf("server returned non-OK status: %d", resp.StatusCode)
-	}
-
-	// Get content type
-	contentType := resp.Header.Get("Content-Type")
-
-	// Check content length
-	contentLength := resp.ContentLength
-	if contentLength == 0 {
-		return false, contentType, fmt.Errorf("file has zero size")
-	}
-
-	// Check for binary content types using optimized helper
-	isBinaryContent := isBinaryContentType(contentType)
-
-	// Log the result
-	if isBinaryContent {
+	isBinary, contentType, err := fc.checkBinaryContent(resp, fileURL, usedGETFallback)
+	if isBinary {
 		fc.logger.Info("Found binary file at %s with Content-Type: %s", fileURL, contentType)
-		return true, contentType, nil
 	}
-
-	fc.logger.Debug("File found but not binary content: %s (Content-Type: %s)",
-		fileURL, contentType)
-	return false, contentType, fmt.Errorf("file is not binary content")
+	return isBinary, contentType, err
 }

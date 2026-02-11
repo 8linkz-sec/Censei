@@ -25,24 +25,34 @@ type HostTracker interface {
 
 // DirectoryScanner handles scanning of open directory listings
 type DirectoryScanner struct {
-	logger          *logging.Logger
-	totalLinksCount int64
+	logger *logging.Logger
 }
 
 // NewDirectoryScanner creates a new directory scanner instance
 func NewDirectoryScanner(logger *logging.Logger) *DirectoryScanner {
 	return &DirectoryScanner{
-		logger:          logger,
-		totalLinksCount: 0,
+		logger: logger,
 	}
 }
 
 // ScanHost processes a host for directory listings and extracts file links
-func (ds *DirectoryScanner) ScanHost(host api.Host, htmlContent string) []string {
+func (ds *DirectoryScanner) ScanHost(host api.Host, htmlContent string, cfg *config.Config) []string {
 	ds.logger.Debug("Scanning directory listing for host: %s", host.URL)
 
 	// Extract links from HTML content
 	links := ds.extractLinks(host.URL, htmlContent)
+
+	// Apply per-directory link limit
+	if cfg.MaxLinksPerDirectory > 0 && len(links) > cfg.MaxLinksPerDirectory {
+		ds.logger.Info("Directory has %d links, limiting to %d", len(links), cfg.MaxLinksPerDirectory)
+		links = links[:cfg.MaxLinksPerDirectory]
+	}
+
+	// Apply total links limit
+	if cfg.MaxTotalLinks > 0 && len(links) > cfg.MaxTotalLinks {
+		ds.logger.Info("Links exceed total limit, limiting to %d", cfg.MaxTotalLinks)
+		links = links[:cfg.MaxTotalLinks]
+	}
 
 	ds.logger.Debug("Directory scan found %d links for %s", len(links), host.URL)
 	return links
@@ -51,18 +61,18 @@ func (ds *DirectoryScanner) ScanHost(host api.Host, htmlContent string) []string
 // ScanHostRecursive performs recursive directory scanning with configurable limits
 func (ds *DirectoryScanner) ScanHostRecursive(host api.Host, htmlContent string, maxDepth int, client HTTPClient, cfg *config.Config, tracker HostTracker) []string {
 	if maxDepth <= 0 {
-		return ds.ScanHost(host, htmlContent)
+		return ds.ScanHost(host, htmlContent, cfg)
 	}
-	// Reset counter for new scan
-	atomic.StoreInt64(&ds.totalLinksCount, 0)
+	// Host-local counter to avoid race conditions when scanning multiple hosts in parallel
+	var totalLinksCount int64
 	visited := make(map[string]bool)
 	allLinks := []string{}
-	ds.scanRecursive(host.URL, htmlContent, 0, maxDepth, visited, &allLinks, client, cfg, tracker)
+	ds.scanRecursive(host.URL, htmlContent, 0, maxDepth, visited, &allLinks, client, cfg, tracker, &totalLinksCount)
 	return allLinks
 }
 
 // scanRecursive performs the actual recursive scanning
-func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDepth, maxDepth int, visited map[string]bool, allLinks *[]string, client HTTPClient, cfg *config.Config, tracker HostTracker) {
+func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDepth, maxDepth int, visited map[string]bool, allLinks *[]string, client HTTPClient, cfg *config.Config, tracker HostTracker, totalLinksCount *int64) {
 	// Check if host is already blocked before any processing
 	if tracker != nil && tracker.IsBlocked(baseURL) {
 		ds.logger.Debug("Host blocked, skipping recursion for: %s", baseURL)
@@ -70,10 +80,10 @@ func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDe
 	}
 
 	// Check total links limit with thread-safe counter
-	currentCount := atomic.LoadInt64(&ds.totalLinksCount)
+	currentCount := atomic.LoadInt64(totalLinksCount)
 	ds.logger.Debug("Recursion check: current count=%d, limit=%d, depth=%d, URL=%s", currentCount, cfg.MaxTotalLinks, currentDepth, baseURL)
 
-	if cfg.MaxTotalLinks > 0 && int(currentCount) > cfg.MaxTotalLinks {
+	if cfg.MaxTotalLinks > 0 && int(currentCount) >= cfg.MaxTotalLinks {
 		ds.logger.Info("Host reached maximum total links (%d >= %d), marking for skip", currentCount, cfg.MaxTotalLinks)
 		if tracker != nil {
 			tracker.RecordSkip(baseURL)
@@ -134,9 +144,21 @@ func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDe
 
 	ds.logger.Debug("Link separation: %d files, %d directories", len(files), len(directories))
 
+	// Enforce total links limit before appending
+	if cfg.MaxTotalLinks > 0 {
+		currentTotal := int(atomic.LoadInt64(totalLinksCount))
+		remaining := cfg.MaxTotalLinks - currentTotal
+		if remaining <= 0 {
+			return
+		}
+		if remaining < len(files) {
+			files = files[:remaining]
+		}
+	}
+
 	// Add files to results and update atomic counter
 	*allLinks = append(*allLinks, files...)
-	newCount := atomic.AddInt64(&ds.totalLinksCount, int64(len(files)))
+	newCount := atomic.AddInt64(totalLinksCount, int64(len(files)))
 	ds.logger.Debug("Added %d files, total count now: %d", len(files), newCount)
 
 	// Recurse into directories if we haven't reached max depth
@@ -174,7 +196,7 @@ func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDe
 			// Check if it's a directory listing
 			if ds.IsDirectoryListing(dirContent) {
 				ds.logger.Debug("Directory confirmed, recursing: %s", dirURL)
-				ds.scanRecursive(dirURL, dirContent, currentDepth+1, maxDepth, visited, allLinks, client, cfg, tracker)
+				ds.scanRecursive(dirURL, dirContent, currentDepth+1, maxDepth, visited, allLinks, client, cfg, tracker, totalLinksCount)
 			} else {
 				ds.logger.Debug("Not a directory listing, skipping: %s", dirURL)
 			}
@@ -232,16 +254,20 @@ func (ds *DirectoryScanner) extractLinks(baseURLStr string, htmlContent string) 
 			return
 		}
 
-		absoluteURL := baseURL.ResolveReference(fileURL).String()
+		resolved := baseURL.ResolveReference(fileURL)
+
+		// Only follow links on the same host to prevent scope creep
+		if resolved.Host != baseURL.Host {
+			ds.logger.Debug("Skipping external link: %s (host %s != %s)", href, resolved.Host, baseURL.Host)
+			return
+		}
+
+		absoluteURL := resolved.String()
 		links = append(links, absoluteURL)
 		ds.logger.Debug("Found directory link: %s", absoluteURL)
 	})
 
-	if len(links) > 0 {
-		ds.logger.Info("Extracted %d links from directory index at %s", len(links), baseURLStr)
-	} else {
-		ds.logger.Debug("Extracted 0 links from directory index at %s", baseURLStr)
-	}
+	ds.logger.Debug("Extracted %d links from directory index at %s", len(links), baseURLStr)
 	return links
 }
 

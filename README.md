@@ -37,7 +37,7 @@ Censei (pronounced like "Sensei") is a command-line tool written in Go that uses
 
 ### Prerequisites
 
-- Go 1.20 or higher
+- Go 1.24 or higher
 - **Censys subscription** for API access (important: This tool does not work without a valid Censys subscription and API credentials!)
 - **For Platform API v3 mode (default):** Censys API credentials (API ID and Secret)
 - **For Legacy mode (optional):** Censys CLI ([Installation via pip](https://github.com/censys/censys-command-line))
@@ -87,10 +87,10 @@ Create the configuration files:
      "legacy_index_type": "hosts",
      "legacy_sort_order": "DESCENDING",
      "legacy_virtual_hosts": "INCLUDE",
-     "queries_file_v3": "./queriesv3.json",
-     "queries_file_legacy": "./legacy_queries.json",
-     "output_dir": "./output",
-     "binary_output_file": "./output/binary_found.txt",
+     "queries_file_v3": "./ressources/queriesv3.json",
+     "queries_file_legacy": "./ressources/legacy_queries.json",
+     "output_dir": "./scan_output",
+     "binary_output_file": "./scan_output/binary_found.txt",
      "http_timeout_seconds": 5,
      "max_concurrent_requests": 10,
      "log_level": "INFO",
@@ -103,7 +103,7 @@ Create the configuration files:
    }
    ```
 
-   > **Note**: The `queries_file_v3` and `queries_file_legacy` fields are optional. If not specified, they default to `./queriesv3.json` and `./legacy_queries.json` respectively. Adjust these paths to match your directory structure.
+   > **Note**: The `queries_file_v3` and `queries_file_legacy` fields are optional. If not specified, they default to `./ressources/queriesv3.json` and `./ressources/legacy_queries.json` respectively. Adjust these paths to match your directory structure.
 
 2. **queriesv3.json** (for Platform API v3 mode) OR **legacy_queries.json** (for legacy mode) - Predefined queries:
    ```json
@@ -188,8 +188,8 @@ Start Censei in interactive mode:
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--config` | Path to configuration file | `./config.json` |
-| `--queries` | Path to queries file | `./queriesv3.json` (or `./legacy_queries.json` in legacy mode) |
+| `--config` | Path to configuration file | `./ressources/config.json` |
+| `--queries` | Path to queries file | `./ressources/queriesv3.json` (or `./ressources/legacy_queries.json` in legacy mode) |
 | `--query` | Direct execution of a specific query | - |
 | `--filter` | Specification of file extensions to filter (comma-separated) | - |
 | `--output` | Override output directory | From configuration |
@@ -231,10 +231,10 @@ For automation or scripts, use the `--query` parameter to execute a specific que
 | `legacy_index_type` | Index type for legacy CLI (hosts, certificates) | `hosts` |
 | `legacy_sort_order` | Sort order for legacy CLI (ASCENDING, DESCENDING) | `DESCENDING` |
 | `legacy_virtual_hosts` | Virtual hosts setting for legacy CLI (INCLUDE, EXCLUDE, ONLY) | `INCLUDE` |
-| `queries_file_v3` | Path to Platform API v3 queries file (optional) | `./queriesv3.json` |
-| `queries_file_legacy` | Path to legacy mode queries file (optional) | `./legacy_queries.json` |
-| `output_dir` | Directory for output files | `./output` |
-| `binary_output_file` | Path for binary file outputs | `./output/binary_found.txt` |
+| `queries_file_v3` | Path to Platform API v3 queries file (optional) | `./ressources/queriesv3.json` |
+| `queries_file_legacy` | Path to legacy mode queries file (optional) | `./ressources/legacy_queries.json` |
+| `output_dir` | Directory for output files | `./scan_output` |
+| `binary_output_file` | Path for binary file outputs | `./scan_output/binary_found.txt` |
 | `http_timeout_seconds` | Timeout for HTTP requests | `5` |
 | `max_concurrent_requests` | Maximum parallel requests | `10` |
 | `log_level` | Logging level (DEBUG, INFO, ERROR) | `INFO` |
@@ -292,11 +292,11 @@ http://example.com/documents/secret.pdf
 
 ### binary_found.txt
 
-Contains paths to binary files identified during scanning:
+Contains URLs of binary files identified during scanning:
 
 ```
-http://example.com/02.08.2022.exe with Content-Type: application/x-msdownload
-http://example.com/tools/app.exe with Content-Type: application/octet-stream
+http://example.com/02.08.2022.exe
+http://example.com/tools/app.exe
 ```
 
 At the end of the raw.txt file, a summary of the scan with statistics and configuration details is appended.
@@ -411,7 +411,7 @@ Solution: Check your query string or try a broader search.
 
 2. Check the generated JSON file to ensure Censys is returning results:
    ```bash
-   cat output/censys_results.json
+   cat scan_output/censys_results.json
    ```
 
 3. Test the Censys CLI manually to verify API functionality:

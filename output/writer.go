@@ -21,7 +21,9 @@ type Writer struct {
 	rawWriter      *bufio.Writer
 	filteredWriter *bufio.Writer
 	binaryWriter   *bufio.Writer
-	mu           sync.Mutex
+	rawMu        sync.Mutex
+	filteredMu   sync.Mutex
+	binaryMu     sync.Mutex
 	logger       *logging.Logger
 
 	// Track seen binary URLs for deduplication (immediate write to file)
@@ -30,7 +32,7 @@ type Writer struct {
 }
 
 // NewWriter creates a new output writer
-func NewWriter(outputDir string, logger *logging.Logger) (*Writer, error) {
+func NewWriter(outputDir string, binaryOutputFile string, logger *logging.Logger) (*Writer, error) {
 	// Ensure output directory exists
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create output directory: %w", err)
@@ -51,8 +53,17 @@ func NewWriter(outputDir string, logger *logging.Logger) (*Writer, error) {
 		return nil, fmt.Errorf("failed to create filtered output file: %w", err)
 	}
 
+	// Ensure binary output file's parent directory exists
+	if dir := filepath.Dir(binaryOutputFile); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			rawFile.Close()
+			filteredFile.Close()
+			return nil, fmt.Errorf("failed to create binary output directory: %w", err)
+		}
+	}
+
 	// Create binary output file
-	binaryPath := filepath.Join(outputDir, "binary_found.txt")
+	binaryPath := binaryOutputFile
 	binaryFile, err := os.Create(binaryPath)
 	if err != nil {
 		rawFile.Close()
@@ -82,8 +93,8 @@ func NewWriter(outputDir string, logger *logging.Logger) (*Writer, error) {
 
 // WriteRawOutput writes a line to the raw output file using buffered I/O
 func (w *Writer) WriteRawOutput(line string) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.rawMu.Lock()
+	defer w.rawMu.Unlock()
 
 	_, err := fmt.Fprintln(w.rawWriter, line)
 	if err != nil {
@@ -96,8 +107,8 @@ func (w *Writer) WriteRawOutput(line string) error {
 
 // WriteFilteredOutput writes a line to the filtered output file using buffered I/O
 func (w *Writer) WriteFilteredOutput(line string) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.filteredMu.Lock()
+	defer w.filteredMu.Unlock()
 
 	_, err := fmt.Fprintln(w.filteredWriter, line)
 	if err != nil {
@@ -111,8 +122,8 @@ func (w *Writer) WriteFilteredOutput(line string) error {
 // WriteBinaryOutput writes binary findings immediately to file (one URL per line)
 // Expected line format: "URL with Content-Type: CONTENT_TYPE"
 func (w *Writer) WriteBinaryOutput(line string) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.binaryMu.Lock()
+	defer w.binaryMu.Unlock()
 
 	// Parse the line to extract URL
 	// Format: "http://example.com/file.exe with Content-Type: application/x-msdownload"
@@ -130,17 +141,10 @@ func (w *Writer) WriteBinaryOutput(line string) error {
 	}
 	w.seenBinaryURLs[fileURL] = true
 
-	// Write immediately to file
+	// Write to buffered writer (flushed periodically by buffer and on Close)
 	_, err := fmt.Fprintln(w.binaryWriter, fileURL)
 	if err != nil {
 		w.logger.Error("Failed to write to binary output: %v", err)
-		return err
-	}
-
-	// Flush immediately to ensure data is written to disk
-	// This ensures data is not lost on abort
-	if err := w.binaryWriter.Flush(); err != nil {
-		w.logger.Error("Failed to flush binary output: %v", err)
 		return err
 	}
 
@@ -148,11 +152,11 @@ func (w *Writer) WriteBinaryOutput(line string) error {
 }
 
 // SortAndGroupBinaryFile reads the binary_found.txt file, groups URLs by host,
-// sorts them alphabetically, and overwrites the file with the grouped format.
+// sorts hosts and URLs within each host alphabetically, and overwrites the file with the grouped format.
 // This should be called after a successful scan completion.
 func (w *Writer) SortAndGroupBinaryFile() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.binaryMu.Lock()
+	defer w.binaryMu.Unlock()
 
 	// First flush the buffer to ensure all data is written
 	if w.binaryWriter != nil {
@@ -161,18 +165,21 @@ func (w *Writer) SortAndGroupBinaryFile() error {
 		}
 	}
 
-	// Read the file
-	data, err := os.ReadFile(w.binaryFilePath)
+	// Read file line-by-line to avoid loading entire file into memory
+	file, err := os.Open(w.binaryFilePath)
 	if err != nil {
-		return fmt.Errorf("failed to read binary file: %w", err)
+		return fmt.Errorf("failed to open binary file: %w", err)
 	}
 
 	// Parse URLs and group by host
-	lines := strings.Split(string(data), "\n")
 	hostFindings := make(map[string][]string) // host -> list of URLs
+	scanner := bufio.NewScanner(file)
+	// Increase max token size to handle very long URL lines safely.
+	const maxURLLineSize = 1024 * 1024 // 1 MB
+	scanner.Buffer(make([]byte, 64*1024), maxURLLineSize)
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
@@ -187,6 +194,11 @@ func (w *Writer) SortAndGroupBinaryFile() error {
 		host := parsedURL.Scheme + "://" + parsedURL.Host
 		hostFindings[host] = append(hostFindings[host], line)
 	}
+	file.Close()
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("failed to read binary file: %w", err)
+	}
 
 	if len(hostFindings) == 0 {
 		return nil
@@ -200,7 +212,7 @@ func (w *Writer) SortAndGroupBinaryFile() error {
 	sort.Strings(hosts)
 
 	// Rewrite the file with grouped format
-	file, err := os.Create(w.binaryFilePath)
+	file, err = os.Create(w.binaryFilePath)
 	if err != nil {
 		return fmt.Errorf("failed to recreate binary file: %w", err)
 	}
@@ -213,6 +225,9 @@ func (w *Writer) SortAndGroupBinaryFile() error {
 		if len(urls) == 0 {
 			continue
 		}
+
+		// Sort URLs within each host group alphabetically
+		sort.Strings(urls)
 
 		// Write host separator
 		separator := fmt.Sprintf("\n=== %s (%d files) ===\n", host, len(urls))
@@ -238,8 +253,12 @@ func (w *Writer) SortAndGroupBinaryFile() error {
 
 // Close flushes buffers and closes all output files
 func (w *Writer) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.rawMu.Lock()
+	defer w.rawMu.Unlock()
+	w.filteredMu.Lock()
+	defer w.filteredMu.Unlock()
+	w.binaryMu.Lock()
+	defer w.binaryMu.Unlock()
 
 	w.logger.Info("Closing output files and flushing buffers")
 

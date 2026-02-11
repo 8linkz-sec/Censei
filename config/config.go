@@ -29,6 +29,7 @@ type Config struct {
 	MaxLinksPerDirectory  int    `json:"max_links_per_directory"`
 	MaxTotalLinks         int    `json:"max_total_links"`
 	MaxSkipsBeforeBlock   int    `json:"max_skips_before_block"`
+	MaxBodySizeMB         int    `json:"max_body_size_mb"`
 	BlocklistFile         string `json:"blocklist_file"`
 	EnableBlocklist       bool   `json:"enable_blocklist"`
 
@@ -178,6 +179,11 @@ func validateConfig(cfg *Config) error {
 	// Validate binary output file path is set
 	if cfg.BinaryOutputFile == "" {
 		return fmt.Errorf("binary_output_file cannot be empty")
+	}
+
+	// Default max body size: 5 MB
+	if cfg.MaxBodySizeMB <= 0 {
+		cfg.MaxBodySizeMB = 5
 	}
 
 	return nil

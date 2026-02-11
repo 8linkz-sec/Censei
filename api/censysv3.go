@@ -100,13 +100,17 @@ func (c *CensysV3Client) ExecuteQuery(query, outputDir string) (string, error) {
 		if response.ResponseEnvelopeSearchQueryResponse.Result != nil &&
 			response.ResponseEnvelopeSearchQueryResponse.Result.Hits != nil {
 
-			resultsCount := len(response.ResponseEnvelopeSearchQueryResponse.Result.Hits)
+			hits := response.ResponseEnvelopeSearchQueryResponse.Result.Hits
 
-			// Append hits directly
-			allResults = append(allResults, response.ResponseEnvelopeSearchQueryResponse.Result.Hits...)
+			// Enforce max results limit before appending
+			remaining := c.Config.V3MaxResults - totalFetched
+			if remaining < len(hits) {
+				hits = hits[:remaining]
+			}
 
-			totalFetched += resultsCount
-			c.Logger.Debug("Fetched %d results (total: %d)", resultsCount, totalFetched)
+			allResults = append(allResults, hits...)
+			totalFetched += len(hits)
+			c.Logger.Debug("Fetched %d results (total: %d)", len(hits), totalFetched)
 		}
 
 		// Check if we've reached the limit
