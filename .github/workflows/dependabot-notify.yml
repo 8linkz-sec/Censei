@@ -6,5 +6,4 @@ jobs:
   notify:
     if: github.actor == 'dependabot[bot]'
     uses: 8linkz-sec/.github/.github/workflows/dependabot-notify.yml@main
-    secrets:
-      DISCORD_DEP: ${{ secrets.DISCORD_DEP }}
+    secrets: inherit
