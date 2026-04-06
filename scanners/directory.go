@@ -25,13 +25,16 @@ type HostTracker interface {
 
 // DirectoryScanner handles scanning of open directory listings
 type DirectoryScanner struct {
-	logger *logging.Logger
+	logger     *logging.Logger
+	permissive bool // If true, use additional heuristics for directory detection
 }
 
-// NewDirectoryScanner creates a new directory scanner instance
-func NewDirectoryScanner(logger *logging.Logger) *DirectoryScanner {
+// NewDirectoryScanner creates a new directory scanner instance.
+// If permissive is true, additional heuristics are used to detect custom directory pages.
+func NewDirectoryScanner(logger *logging.Logger, permissive bool) *DirectoryScanner {
 	return &DirectoryScanner{
-		logger: logger,
+		logger:     logger,
+		permissive: permissive,
 	}
 }
 
@@ -130,12 +133,17 @@ func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDe
 
 	// Separate files from directories
 	// Pre-allocate with estimated capacity based on typical directory structure
-	// Typical ratio: 60-80% files, 20-40% directories
 	files := make([]string, 0, len(links)/2)
 	directories := make([]string, 0, len(links)/4)
 
 	for _, link := range links {
-		if ds.isDirectory(link) {
+		if strings.HasSuffix(link, "/") {
+			// Definite directory (trailing slash)
+			directories = append(directories, link)
+		} else if ds.isDirectory(link) {
+			// Ambiguous: no extension, no trailing slash (e.g., README, LICENSE, backup)
+			// Add to both: capture as file AND try as directory
+			files = append(files, link)
 			directories = append(directories, link)
 		} else {
 			files = append(files, link)
@@ -191,6 +199,12 @@ func (ds *DirectoryScanner) scanRecursive(baseURL, htmlContent string, currentDe
 					}
 				}
 				continue
+			}
+
+			// Re-check if host was blocked while we were fetching
+			if tracker != nil && tracker.IsBlocked(dirURL) {
+				ds.logger.Debug("Host became blocked during fetch, stopping recursion: %s", dirURL)
+				return
 			}
 
 			// Check if it's a directory listing
@@ -257,8 +271,9 @@ func (ds *DirectoryScanner) extractLinks(baseURLStr string, htmlContent string) 
 		resolved := baseURL.ResolveReference(fileURL)
 
 		// Only follow links on the same host to prevent scope creep
-		if resolved.Host != baseURL.Host {
-			ds.logger.Debug("Skipping external link: %s (host %s != %s)", href, resolved.Host, baseURL.Host)
+		// Compare Hostname() (without port) to avoid false mismatches on default ports
+		if resolved.Hostname() != baseURL.Hostname() {
+			ds.logger.Debug("Skipping external link: %s (host %s != %s)", href, resolved.Hostname(), baseURL.Hostname())
 			return
 		}
 
@@ -271,77 +286,162 @@ func (ds *DirectoryScanner) extractLinks(baseURLStr string, htmlContent string) 
 	return links
 }
 
-// IsDirectoryListing checks if the HTML content appears to be a directory listing
+// IsDirectoryListing checks if the HTML content appears to be a directory listing.
+// In strict mode (default): returns true for strong indicators, weak indicators
+// corroborated by link structure, or strong structural evidence (parent link + many
+// file-extension links). In permissive mode: also detects <pre>/<table>-based pages
+// with lower thresholds and pages with many file-extension links even without parent link.
 func (ds *DirectoryScanner) IsDirectoryListing(htmlContent string) bool {
-	// Check for common directory listing indicators
 	content := strings.ToLower(htmlContent)
 
-	// Common directory listing patterns
-	directoryIndicators := []string{
-		"index of",
-		"directory listing",
-		"parent directory",
+	// Strong directory listing indicators (title/header patterns from web servers)
+	strongIndicators := []string{
 		"<title>index of",
-		"apache/", // Apache directory listings
-		"nginx/",  // Nginx directory listings
+		"directory listing for",
+		"directory listing of",
+		"[to parent directory]", // IIS
 	}
 
-	for _, indicator := range directoryIndicators {
+	for _, indicator := range strongIndicators {
 		if strings.Contains(content, indicator) {
-			ds.logger.Debug("Directory listing detected: found indicator '%s'", indicator)
+			ds.logger.Debug("Directory listing detected: found strong indicator '%s'", indicator)
 			return true
 		}
 	}
 
-	// Check for multiple file links (heuristic)
+	// Weaker indicators that need corroboration from link structure
+	weakIndicators := []string{
+		"index of",
+		"parent directory",
+		"apache/",
+		"nginx/",
+		"lighttpd/",
+		"last modified", // Common column header in autoindex pages
+	}
+
+	hasWeakIndicator := false
+	for _, indicator := range weakIndicators {
+		if strings.Contains(content, indicator) {
+			hasWeakIndicator = true
+			ds.logger.Debug("Directory listing: found weak indicator '%s'", indicator)
+			break
+		}
+	}
+
+	// Always parse HTML and analyze link structure (no early bail-out)
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
 	if err != nil {
 		return false
 	}
 
-	linkCount := 0
+	hasParentLink := false
+	fileLinkCount := 0
+	fileExtLinkCount := 0
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
 		href, exists := s.Attr("href")
-		if exists && href != "../" && href != ".." && href != "." && href != "/" {
-			linkCount++
+		if !exists {
+			return
+		}
+		if href == "../" || href == ".." {
+			hasParentLink = true
+			return
+		}
+		if href != "." && href != "/" && !strings.HasPrefix(href, "?C=") && !strings.HasPrefix(href, "/?sort=") {
+			fileLinkCount++
+			if looksLikeFile(href) {
+				fileExtLinkCount++
+			}
 		}
 	})
 
-	// If we have many file links, it's probably a directory
-	if linkCount > 5 {
-		ds.logger.Debug("Directory listing detected: found %d file links", linkCount)
+	// Weak indicator + parent link + file links → confirmed
+	if hasWeakIndicator && hasParentLink && fileLinkCount > 2 {
+		ds.logger.Debug("Directory listing confirmed: weak indicator + parent link + %d file links", fileLinkCount)
 		return true
+	}
+
+	// Structural detection (both modes): parent link + many file-extension links
+	// is strong evidence even without any text marker
+	if hasParentLink && fileExtLinkCount > 10 {
+		ds.logger.Debug("Directory listing detected (structural): parent link + %d file-extension links", fileExtLinkCount)
+		return true
+	}
+
+	// Permissive mode: additional heuristics for custom/non-standard directory pages
+	if ds.permissive {
+		// <pre> block with parent link and some links → typical autoindex without title indicator
+		hasPreBlock := strings.Contains(content, "<pre>")
+		if hasPreBlock && hasParentLink && fileLinkCount > 2 {
+			ds.logger.Debug("Directory listing detected (permissive): <pre> block + parent link + %d file links", fileLinkCount)
+			return true
+		}
+
+		// Table layout with parent link and some links → custom directory page
+		hasTable := strings.Contains(content, "<table")
+		if hasTable && hasParentLink && fileLinkCount > 2 {
+			ds.logger.Debug("Directory listing detected (permissive): <table> + parent link + %d file links", fileLinkCount)
+			return true
+		}
+
+		// Many file-extension links even without parent link → likely a file listing
+		if fileExtLinkCount > 10 {
+			ds.logger.Debug("Directory listing detected (permissive): %d file-extension links (no parent link required)", fileExtLinkCount)
+			return true
+		}
 	}
 
 	return false
 }
 
-// isDirectory tries to determine if a URL points to a directory
-func (ds *DirectoryScanner) isDirectory(url string) bool {
-	// Validate input
-	if url == "" {
+// looksLikeFile checks if a URL's last path segment has a file extension.
+func looksLikeFile(href string) bool {
+	// Strip query and fragment
+	if idx := strings.IndexAny(href, "?#"); idx != -1 {
+		href = href[:idx]
+	}
+	// Trailing slash → directory, not a file
+	if strings.HasSuffix(href, "/") {
+		return false
+	}
+	// Extract last path segment
+	idx := strings.LastIndex(href, "/")
+	lastPart := href
+	if idx != -1 {
+		lastPart = href[idx+1:]
+	}
+	return lastPart != "" && strings.Contains(lastPart, ".")
+}
+
+// isDirectory tries to determine if a URL points to a directory.
+// Only trailing-slash URLs are treated as directories to avoid false positives
+// with dynamic pages (e.g. /products?id=123&page=1).
+func (ds *DirectoryScanner) isDirectory(rawURL string) bool {
+	if rawURL == "" {
 		return false
 	}
 
-	// Simple heuristic: URLs ending with / are directories
-	// Also check for common directory patterns
-	if strings.HasSuffix(url, "/") {
+	// URLs with query parameters are not directories (dynamic/catalog pages)
+	if strings.Contains(rawURL, "?") {
+		return false
+	}
+
+	// URLs ending with / are directories
+	if strings.HasSuffix(rawURL, "/") {
 		return true
 	}
 
-	// Check for URLs without file extensions (likely directories)
-	// Safely extract the last part after the last slash
-	index := strings.LastIndex(url, "/")
+	// Check if the last path segment has no file extension — but only for
+	// path-only URLs (no query string, which we already excluded above).
+	index := strings.LastIndex(rawURL, "/")
 	var lastPart string
 	if index == -1 {
-		// No slash found - treat entire URL as last part
-		lastPart = url
+		lastPart = rawURL
 	} else {
-		lastPart = url[index+1:]
+		lastPart = rawURL[index+1:]
 	}
 
 	// If last part has no extension and is not empty, likely a directory
-	if !strings.Contains(lastPart, ".") && lastPart != "" {
+	if lastPart != "" && !strings.Contains(lastPart, ".") {
 		return true
 	}
 

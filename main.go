@@ -318,7 +318,7 @@ func runQueryConfig(cfg *config.Config, queryConfig *config.Query, logger *loggi
 		logger.Error("Failed to initialize output writer: %v", err)
 		os.Exit(1)
 	}
-	defer writer.Close()
+	defer func() { _ = writer.Close() }()
 
 	// Initialize filter
 	fileFilter := filter.NewFilter(queryConfig.Filters, logger)

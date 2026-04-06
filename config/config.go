@@ -31,7 +31,9 @@ type Config struct {
 	MaxSkipsBeforeBlock   int    `json:"max_skips_before_block"`
 	MaxBodySizeMB         int    `json:"max_body_size_mb"`
 	BlocklistFile         string `json:"blocklist_file"`
-	EnableBlocklist       bool   `json:"enable_blocklist"`
+	EnableBlocklist               bool   `json:"enable_blocklist"`
+	PermissiveDirectoryDetection bool   `json:"permissive_directory_detection"`
+	FollowHostnameRedirects      bool   `json:"follow_hostname_redirects"`
 
 	// Legacy CLI parameters (for censys-cli tool)
 	LegacyPages        int    `json:"legacy_pages"`

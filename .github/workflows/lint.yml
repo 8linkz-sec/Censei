@@ -1,8 +1,0 @@
-name: Lint
-on:
-  pull_request:
-  push:
-    branches: [main]
-jobs:
-  lint:
-    uses: 8linkz-sec/.github/.github/workflows/golint.yml@main

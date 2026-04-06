@@ -38,26 +38,26 @@ func FormatSummary(
 
 	summary := strings.Builder{}
 	summary.WriteString("=== Censei Scan Summary ===\n")
-	summary.WriteString(fmt.Sprintf("Query: %s\n", query))
-	summary.WriteString(fmt.Sprintf("Start time: %s\n", FormatTimestamp(startTime)))
-	summary.WriteString(fmt.Sprintf("End time: %s\n", FormatTimestamp(endTime)))
-	summary.WriteString(fmt.Sprintf("Duration: %s\n", duration.Round(time.Second)))
-	summary.WriteString(fmt.Sprintf("Total hosts found: %d\n", totalHosts))
-	summary.WriteString(fmt.Sprintf("Online hosts: %d\n", onlineHosts))
-	summary.WriteString(fmt.Sprintf("Total files found: %d\n", totalFiles))
-	summary.WriteString(fmt.Sprintf("Filtered files: %d\n", filteredFiles))
-	summary.WriteString(fmt.Sprintf("Applied filters: %s\n", filterStr))
+	fmt.Fprintf(&summary, "Query: %s\n", query)
+	fmt.Fprintf(&summary, "Start time: %s\n", FormatTimestamp(startTime))
+	fmt.Fprintf(&summary, "End time: %s\n", FormatTimestamp(endTime))
+	fmt.Fprintf(&summary, "Duration: %s\n", duration.Round(time.Second))
+	fmt.Fprintf(&summary, "Total hosts found: %d\n", totalHosts)
+	fmt.Fprintf(&summary, "Online hosts: %d\n", onlineHosts)
+	fmt.Fprintf(&summary, "Total files found: %d\n", totalFiles)
+	fmt.Fprintf(&summary, "Filtered files: %d\n", filteredFiles)
+	fmt.Fprintf(&summary, "Applied filters: %s\n", filterStr)
 
 	// Add download information to summary
 	if downloadEnabled {
 		summary.WriteString("File check enabled: Yes\n")
 		if targetFileName != "" {
-			summary.WriteString(fmt.Sprintf("Target filename: %s\n", targetFileName))
+			fmt.Fprintf(&summary, "Target filename: %s\n", targetFileName)
 		}
-		summary.WriteString(fmt.Sprintf("Files checked: %d\n", checkedFiles))
-		summary.WriteString(fmt.Sprintf("Binary files found: %d\n", binaryFilesFound))
+		fmt.Fprintf(&summary, "Files checked: %d\n", checkedFiles)
+		fmt.Fprintf(&summary, "Binary files found: %d\n", binaryFilesFound)
 		if binaryFilesFound > 0 {
-			summary.WriteString(fmt.Sprintf("Binary files list: %s\n", binaryOutputFile))
+			fmt.Fprintf(&summary, "Binary files list: %s\n", binaryOutputFile)
 		}
 	} else {
 		summary.WriteString("File check enabled: No\n")

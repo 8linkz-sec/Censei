@@ -27,5 +27,7 @@
     "max_skips_before_block": 5,
     "max_body_size_mb": 5,
     "blocklist_file": "./blocklist.txt",
-    "enable_blocklist": false
+    "enable_blocklist": false,
+    "permissive_directory_detection": true,
+    "follow_hostname_redirects": true
 }

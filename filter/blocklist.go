@@ -64,7 +64,7 @@ func (b *Blocklist) Load() error {
 	if err != nil {
 		return fmt.Errorf("failed to open blocklist file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
 	count := 0
@@ -131,12 +131,12 @@ func (b *Blocklist) Save() error {
 	if err != nil {
 		return fmt.Errorf("failed to create blocklist file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Write header comment
-	fmt.Fprintf(file, "# Censei Blocklist - Generated on %s\n", time.Now().Format(time.RFC3339))
-	fmt.Fprintf(file, "# Format: hostname timestamp\n")
-	fmt.Fprintf(file, "# Hosts that exceeded skip limits and are permanently blocked\n\n")
+	_, _ = fmt.Fprintf(file, "# Censei Blocklist - Generated on %s\n", time.Now().Format(time.RFC3339))
+	_, _ = fmt.Fprintf(file, "# Format: hostname timestamp\n")
+	_, _ = fmt.Fprintf(file, "# Hosts that exceeded skip limits and are permanently blocked\n\n")
 
 	// Write hosts from the copy
 	for hostname, timestamp := range hostsCopy {

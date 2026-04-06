@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -50,8 +51,21 @@ func NewClient(timeoutSeconds int, logger *logging.Logger, cfg *config.Config) *
 		Timeout:   time.Duration(timeoutSeconds) * time.Second,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Don't follow redirects
-			return http.ErrUseLastResponse
+			// Limit redirect chain length
+			if len(via) >= 5 {
+				return fmt.Errorf("stopped after 5 redirects")
+			}
+			prevHost := via[len(via)-1].URL.Hostname()
+			targetHost := req.URL.Hostname()
+			if prevHost != targetHost {
+				// Allow IP→hostname redirect only for the first cross-host hop
+				// (previous hop was an IP). After that, enforce same-host.
+				if cfg.FollowHostnameRedirects && net.ParseIP(prevHost) != nil {
+					return nil
+				}
+				return http.ErrUseLastResponse
+			}
+			return nil
 		},
 	}
 
@@ -90,7 +104,7 @@ func (c *Client) CheckHostAndFetch(host api.Host) (bool, string, error) {
 		c.logger.Debug("Host offline or unreachable: %s (%s)", host.URL, err)
 		return false, "", nil // Not an error, just offline
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
@@ -101,10 +115,8 @@ func (c *Client) CheckHostAndFetch(host api.Host) (bool, string, error) {
 	// Read the response body with configurable size limit to prevent memory exhaustion
 	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBodySize))
 	if err != nil {
-		// Timeout errors for large directories (e.g., /calls-old/) are common
-		// Log as debug and continue - the host is online, just slow to respond
-		c.logger.Debug("Failed to read response body for %s: %v (skipping)", host.URL, err)
-		return true, "", nil // Return empty body, but mark host as online
+		c.logger.Info("Failed to read response body for %s: %v", host.URL, err)
+		return false, "", fmt.Errorf("body read failed: %w", err)
 	}
 
 	// Warn when body was truncated - later links in the listing will be missed

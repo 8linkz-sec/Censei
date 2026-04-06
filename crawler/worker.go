@@ -3,6 +3,7 @@ package crawler
 import (
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -68,7 +69,7 @@ func NewWorker(
 		filter:           fileFilter,
 		writer:           writer,
 		logger:           logger,
-		directoryScanner: scanners.NewDirectoryScanner(logger),
+		directoryScanner: scanners.NewDirectoryScanner(logger, config.PermissiveDirectoryDetection),
 		queryConfig:      queryConfig,
 		config:           config,
 		maxWorkers:       maxWorkers,
@@ -149,9 +150,9 @@ func (w *Worker) processHost(host api.Host) {
 		return
 	}
 
-	// Check if entire base host is blocked
+	// Check if entire base host is blocked (in-memory, current run only)
 	if _, isBlocked := w.blockedHosts.Load(baseHost); isBlocked {
-		w.logger.Debug("Skipping host - base host is blocked: %s", host.URL)
+		w.logger.Debug("Skipping host - blocked for current run: %s", host.URL)
 		return
 	}
 
@@ -164,6 +165,12 @@ func (w *Worker) processHost(host api.Host) {
 
 	if !online {
 		w.logger.Debug("Host is offline: %s", host.URL)
+		return
+	}
+
+	// Re-check if host was blocked while we were fetching
+	if _, isBlocked := w.blockedHosts.Load(baseHost); isBlocked {
+		w.logger.Debug("Host became blocked during fetch, skipping: %s", host.URL)
 		return
 	}
 
@@ -237,12 +244,12 @@ func (w *Worker) processDirectoryContent(host api.Host, htmlContent string) {
 
 	// Early check for blocked host
 	if w.blocklist.IsBlocked(baseHost) {
-		w.logger.Debug("Skipping directory processing - host in blocklist: %s", host.URL)
+		w.logger.Debug("Skipping directory processing - host in persistent blocklist: %s", host.URL)
 		return
 	}
 
 	if _, isBlocked := w.blockedHosts.Load(baseHost); isBlocked {
-		w.logger.Debug("Skipping directory processing - host blocked: %s", host.URL)
+		w.logger.Debug("Skipping directory processing - host blocked for current run: %s", host.URL)
 		return
 	}
 
@@ -373,29 +380,46 @@ func (w *Worker) GetStats() (int, int, int, int, int, int, int) {
 		w.stats.filteredFiles, w.stats.checkedFiles, w.stats.binaryFilesFound, w.stats.writeErrors
 }
 
-// extractBaseHost extracts the base host (IP only) from a full URL
+// extractBaseHost extracts the base host (IP only) from a full URL.
+// Handles scheme-less inputs like "1.2.3.4", "1.2.3.4/path", "1.2.3.4:443/path".
 func (w *Worker) extractBaseHost(fullURL string) string {
+	if fullURL == "" {
+		return ""
+	}
+
 	parsedURL, err := url.Parse(fullURL)
-	if err != nil {
-		w.logger.Debug("Failed to parse URL %s: %v", fullURL, err)
-		return fullURL // Fallback to full URL if parsing fails
+	if err == nil && parsedURL.Hostname() != "" {
+		w.logger.Debug("Extracted base host: %s from URL: %s", parsedURL.Hostname(), fullURL)
+		return parsedURL.Hostname()
 	}
 
-	// Extract hostname without port
-	hostname := parsedURL.Hostname()
-	if hostname == "" {
-		w.logger.Debug("Failed to extract hostname from URL %s", fullURL)
-		return parsedURL.Host // Fallback to host with port
+	// Fallback for scheme-less inputs: prepend "//" so net/url treats it as a host
+	parsedURL, err = url.Parse("//" + fullURL)
+	if err == nil && parsedURL.Hostname() != "" {
+		w.logger.Debug("Extracted base host (fallback): %s from URL: %s", parsedURL.Hostname(), fullURL)
+		return parsedURL.Hostname()
 	}
 
-	w.logger.Debug("Extracted base host: %s from URL: %s", hostname, fullURL)
-	return hostname
+	// Last resort: strip path/port manually
+	host := strings.Split(fullURL, "/")[0]
+	host = strings.Split(host, ":")[0]
+	if host != "" {
+		w.logger.Debug("Extracted base host (manual): %s from URL: %s", host, fullURL)
+		return host
+	}
+
+	w.logger.Debug("Failed to extract hostname from URL %s", fullURL)
+	return ""
 }
 
 // RecordSkip implements scanners.HostTracker.RecordSkip
 // Records a skip/timeout event for a URL and blocks the host if threshold is reached
 func (w *Worker) RecordSkip(hostURL string) {
 	baseHost := w.extractBaseHost(hostURL)
+	if baseHost == "" {
+		w.logger.Info("RecordSkip called with unresolvable host, ignoring: %s", hostURL)
+		return
+	}
 	w.logger.Debug("Skip triggered for: %s (base: %s)", hostURL, baseHost)
 
 	// Increment skip counter for base host
@@ -404,11 +428,16 @@ func (w *Worker) RecordSkip(hostURL string) {
 
 	w.logger.Debug("Skip count for base host %s: %d", baseHost, newSkipCount)
 
-	// Check if we should block entire base host
+	// Block entire base host when threshold is reached (only on first crossing)
 	if w.config.MaxSkipsBeforeBlock > 0 && newSkipCount >= int64(w.config.MaxSkipsBeforeBlock) {
-		w.logger.Info("Blocking entire base host after %d skips: %s", newSkipCount, baseHost)
-		w.blockedHosts.Store(baseHost, true)
-		w.blocklist.AddHost(baseHost)
+		if _, alreadyBlocked := w.blockedHosts.LoadOrStore(baseHost, true); !alreadyBlocked {
+			if w.config.EnableBlocklist {
+				w.logger.Info("Blocking base host after %d skips (persistent blocklist): %s", newSkipCount, baseHost)
+			} else {
+				w.logger.Info("Blocking base host after %d skips (current run only, enable_blocklist=false): %s", newSkipCount, baseHost)
+			}
+			w.blocklist.AddHost(baseHost)
+		}
 	}
 }
 
@@ -416,6 +445,10 @@ func (w *Worker) RecordSkip(hostURL string) {
 // Checks if a host is blocked (either in persistent blocklist or in-memory)
 func (w *Worker) IsBlocked(hostURL string) bool {
 	baseHost := w.extractBaseHost(hostURL)
+	if baseHost == "" {
+		w.logger.Info("IsBlocked called with unresolvable host, treating as not blocked: %s", hostURL)
+		return false
+	}
 
 	// Check persistent blocklist
 	if w.blocklist.IsBlocked(baseHost) {

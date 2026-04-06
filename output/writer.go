@@ -49,15 +49,15 @@ func NewWriter(outputDir string, binaryOutputFile string, logger *logging.Logger
 	filteredPath := filepath.Join(outputDir, "filtered.txt")
 	filteredFile, err := os.Create(filteredPath)
 	if err != nil {
-		rawFile.Close()
+		_ = rawFile.Close()
 		return nil, fmt.Errorf("failed to create filtered output file: %w", err)
 	}
 
 	// Ensure binary output file's parent directory exists
 	if dir := filepath.Dir(binaryOutputFile); dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
-			rawFile.Close()
-			filteredFile.Close()
+			_ = rawFile.Close()
+			_ = filteredFile.Close()
 			return nil, fmt.Errorf("failed to create binary output directory: %w", err)
 		}
 	}
@@ -66,8 +66,8 @@ func NewWriter(outputDir string, binaryOutputFile string, logger *logging.Logger
 	binaryPath := binaryOutputFile
 	binaryFile, err := os.Create(binaryPath)
 	if err != nil {
-		rawFile.Close()
-		filteredFile.Close()
+		_ = rawFile.Close()
+		_ = filteredFile.Close()
 		return nil, fmt.Errorf("failed to create binary output file: %w", err)
 	}
 
@@ -194,7 +194,7 @@ func (w *Writer) SortAndGroupBinaryFile() error {
 		host := parsedURL.Scheme + "://" + parsedURL.Host
 		hostFindings[host] = append(hostFindings[host], line)
 	}
-	file.Close()
+	_ = file.Close()
 
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("failed to read binary file: %w", err)
@@ -216,7 +216,7 @@ func (w *Writer) SortAndGroupBinaryFile() error {
 	if err != nil {
 		return fmt.Errorf("failed to recreate binary file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	writer := bufio.NewWriter(file)
 

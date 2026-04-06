@@ -183,7 +183,7 @@ func (fc *FileChecker) doHEADWithGETFallback(fileURL string) (*http.Response, bo
 	// Fallback to GET for common HEAD-incompatible responses.
 	switch resp.StatusCode {
 	case http.StatusMethodNotAllowed, http.StatusNotImplemented, http.StatusForbidden:
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		fc.logger.Debug("HEAD returned %d for %s, falling back to GET", resp.StatusCode, fileURL)
 
 		getReq, err := http.NewRequest("GET", fileURL, nil)
@@ -264,7 +264,7 @@ func (fc *FileChecker) CheckSpecificFile(baseURL, fileName string) (bool, string
 	if err != nil {
 		return false, "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	isBinary, contentType, err := fc.checkBinaryContent(resp, fileURL, usedGETFallback)
 	if isBinary {
@@ -302,7 +302,7 @@ func (fc *FileChecker) CheckFileURL(fileURL string) (bool, string, error) {
 	if err != nil {
 		return false, "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	isBinary, contentType, err := fc.checkBinaryContent(resp, fileURL, usedGETFallback)
 	if isBinary {

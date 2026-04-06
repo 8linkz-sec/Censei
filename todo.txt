@@ -1,0 +1,198 @@
+TODO: Host-Blocking greift sichtbar nicht konsequent (Analyse aus Log)
+
+1. [DONE] Block-Key kann leer sein ("Blocking entire base host ...: " ohne Host)
+   Datei: crawler/worker.go:385, crawler/worker.go:417, crawler/worker.go:446
+   Fix (umgesetzt):
+   - `extractBaseHost()` hat jetzt 3-stufigen Fallback: normales Parsing -> "//" Prefix -> manuelles Split.
+     Liefert fuer scheme-lose Inputs (1.2.3.4, 1.2.3.4/path, 1.2.3.4:443/path) korrekt den Host.
+   - `RecordSkip()` und `IsBlocked()` brechen bei leerem baseHost sofort ab (mit Info-Log).
+   Tests: TestExtractBaseHost (9 Subtests), TestRecordSkipIgnoresEmptyHost, TestIsBlockedReturnsFalseForEmptyHost
+
+2. [DONE] "Blocking ..." wird nach Threshold immer wieder geloggt (Spam, irrefuehrend)
+   Datei: crawler/worker.go:431-441
+   Fix (umgesetzt):
+   - `blockedHosts.LoadOrStore()` statt `Store()` — Log + Blocklist-Write nur beim ersten Ueberschreiten.
+   Tests: TestBlockOnlyOnceAtThreshold
+
+3. [DONE + WONTFIX] Blocking ist nur kooperativ; bereits laufende Jobs laufen weiter
+   Dateien: crawler/worker.go:170-174, scanners/directory.go:196-200
+   Fix (umgesetzt):
+   - In `processHost`: Re-Check via `blockedHosts.Load()` direkt nach `CheckHostAndFetch()`.
+   - In `scanRecursive`: Re-Check via `tracker.IsBlocked()` nach erfolgreichem Fetch, vor IsDirectoryListing.
+   Tests: TestIsBlockedAfterRecordSkip
+   WONTFIX — Kein harter Sofort-Stopp (Context-Cancellation pro Base-Host):
+   - Zwischen zwei Checkpoints laeuft nur noch CPU-Processing (HTML-Parsen, Link-Extraktion) im ms-Bereich.
+   - Kein neuer Netzwerk-Fetch geht mehr raus fuer einen geblockten Host.
+   - Context-Cancellation waere grosser Umbau fuer minimalen Gewinn (ms statt s).
+
+4. [DONE] False Positives bei Directory-Erkennung verursachen Rekursions-Explosion
+   Dateien: scanners/directory.go:282-349 (IsDirectoryListing), scanners/directory.go:354-385 (isDirectory)
+   Fix (umgesetzt):
+   - `IsDirectoryListing()`: Link-Count allein reicht nicht mehr. Nur starke Indikatoren (<title>index of)
+     sind direkt ausreichend. Schwache Indikatoren (apache/, parent directory) brauchen Bestaetigung
+     durch Parent-Link + mehrere File-Links.
+   - `isDirectory()`: URLs mit Query-Parametern (?) werden nicht mehr als Directory klassifiziert.
+   Tests: TestIsDirectory (9 Subtests), TestIsDirectoryListing_StrongIndicator,
+          TestIsDirectoryListing_WeakIndicatorWithStructure, TestIsDirectoryListing_WeakIndicatorWithoutParentLink,
+          TestIsDirectoryListing_NormalWebpageManyLinks, TestIsDirectoryListing_NginxAutoindex
+
+5. [DONE] Erwartungsmanagement: "geblockt" bedeutet aktuell nicht zwingend persistent
+   Dateien: crawler/worker.go:434-437
+   Fix (umgesetzt):
+   - Block-Log unterscheidet jetzt explizit:
+     "persistent blocklist" (wenn enable_blocklist=true) vs.
+     "current run only, enable_blocklist=false" (wenn disable).
+   - Alle Debug-Meldungen differenzieren "in persistent blocklist" vs. "blocked for current run".
+
+6. [DONE] Tests nachgezogen
+   Dateien: crawler/worker_test.go, scanners/directory_test.go (in .gitignore)
+   28 Tests gesamt (inkl. Subtests), alle PASS:
+   - crawler/worker_test.go: 13 Tests (9x extractBaseHost, RecordSkip, IsBlocked, Threshold, BlockAfterSkip)
+   - scanners/directory_test.go: 15 Tests (9x isDirectory, 6x IsDirectoryListing)
+
+ALLE PUNKTE ABGESCHLOSSEN (1-5 DONE, 3 WONTFIX fuer Context-Cancellation, 6 Tests DONE).
+
+---
+
+TODO: Open-Directory-Scan Review (neue Funde)
+
+1. [DONE] Redirects werden effektiv nicht gescannt (False Negatives)
+   Datei: crawler/client.go:52-62
+   Fix (umgesetzt):
+   - Same-Host-Redirects werden jetzt gefolgt (max 5 Hops), inkl. Scheme-Upgrades (http->https)
+     und Trailing-Slash-Redirects (/dir -> /dir/).
+   - Cross-Host-Redirects bleiben geblockt (http.ErrUseLastResponse).
+   Tests: TestCheckHostAndFetch_FollowsSameHostRedirect, TestCheckHostAndFetch_BlocksCrossHostRedirect
+
+2. [DONE] Body-Read-Fehler/Timeouts werden als "online, aber leer" geschluckt
+   Datei: crawler/client.go:109-112
+   Fix (umgesetzt):
+   - Body-Read-Fehler geben jetzt `false, "", error` zurueck statt `true, "", nil`.
+   - Caller loggt Fehler und ueberspringt Host (statt still als "online ohne Inhalt" zu behandeln).
+   Tests: TestCheckHostAndFetch_OfflineHost, TestCheckHostAndFetch_Returns200WithContent
+
+3. [DONE] Same-Host-Links koennen wegen Port-Mismatch als extern verworfen werden
+   Datei: scanners/directory.go:275
+   Fix (umgesetzt):
+   - Vergleich nutzt jetzt `Hostname()` statt `Host` — Default-Ports verursachen keine Mismatches mehr.
+   Tests: TestExtractLinks_SameHostDifferentPort
+
+4. [DONE] Rekursiv-Scan verliert echte Dateien ohne Dateiendung
+   Datei: scanners/directory.go:140-148
+   Fix (umgesetzt):
+   - Extensionlose Pfade ohne Trailing-Slash (README, LICENSE, backup) werden jetzt in BEIDE Listen
+     aufgenommen (File + Directory). Sie werden als Datei erfasst UND als moegliches Directory getestet.
+   - Trailing-Slash-URLs bleiben reine Directories, URLs mit Extension bleiben reine Files.
+
+5. [DONE] Directory-Erkennung ist jetzt relativ strikt (Tradeoff)
+   Dateien: scanners/directory.go:29, config/config.go:35
+   Fix (umgesetzt):
+   - Neues Config-Feld: `permissive_directory_detection` (default: false = strict).
+   - Permissive Modus erkennt zusaetzlich <pre>-Bloecke und <table>-Layouts mit Parent-Link + vielen File-Links.
+   - Webshops ohne Parent-Link werden auch im permissive Modus nicht faelschlich erkannt.
+   Tests: TestIsDirectoryListing_PermissivePreBlock, TestIsDirectoryListing_PermissiveTableLayout,
+          TestIsDirectoryListing_PermissiveNoFalsePositiveWebshop
+
+6. [DONE] Tests nachgezogen
+   Dateien: crawler/client_test.go (neu), crawler/worker_test.go, scanners/directory_test.go (in .gitignore)
+   40 Tests gesamt (inkl. Subtests), alle PASS:
+   - crawler/client_test.go: 4 Tests (Redirect same-host, Redirect cross-host, Offline, 200+Content)
+   - crawler/worker_test.go: 13 Tests (extractBaseHost, RecordSkip, IsBlocked, Threshold, BlockAfterSkip)
+   - scanners/directory_test.go: 22 Tests (isDirectory, IsDirectoryListing strict+permissive, Port-Mismatch)
+
+ALLE PUNKTE ABGESCHLOSSEN.
+
+---
+
+TODO: Open-Directory-Scan Nachpruefung (Restpunkte)
+
+1. [DONE] Test fuer Body-Read-Error-Pfad fehlt noch
+   Dateien: crawler/client.go:109-113, crawler/client_test.go
+   Fix (umgesetzt):
+   - Neuer Test `TestCheckHostAndFetch_BodyReadError` in client_test.go.
+   - Server verspricht Content-Length: 100000, sendet nur "partial", schliesst Verbindung.
+   - Verifiziert: online=false, content="", error!=nil.
+
+2. [DONE] `permissive_directory_detection` fehlt in der Beispiel-Config
+   Dateien: config/config.go:35, ressources/config.json
+   Fix (umgesetzt):
+   - Key `"permissive_directory_detection": false` in ressources/config.json aufgenommen.
+
+---
+
+TODO: Open-Directory-Erkennung (korrigierte Einordnung nach Scope-Klaerung)
+
+Scope (wichtig):
+- Flow ist immer `Censys -> IP+Port -> Scan dieser URL`.
+- Ziel ist Open-Directory-Erkennung/Abgreifen auf dieser URL (und rekursiv von dort), NICHT allgemeine Pfad-Discovery.
+
+Bewusstes Design / NICHT als Bug behandeln (Schutz vor Endlosschleifen/DoS):
+1. [BY DESIGN] Blockliste / Skip-basiertes Host-Blocking
+   Dateien: crawler/worker.go, scanners/directory.go, ressources/config.json (`max_skips_before_block`)
+   Grund:
+   - Verzeichnisse/Pagination koennen unendlich werden.
+   - Schutzmechanismus ist notwendig und soll nicht "weggefixt" werden.
+
+2. [BY DESIGN] Link-/Gesamt-/Body-Limits
+   Dateien: scanners/directory.go, crawler/client.go, ressources/config.json
+   Keys:
+   - `max_links_per_directory`
+   - `max_total_links`
+   - `max_body_size_mb`
+   Grund:
+   - Verhindert unendliches/unkontrolliertes Abgrasen grosser oder feindlicher Verzeichnisse.
+
+Verbleibende Verbesserungen (relevant fuer bessere OD-Erkennung):
+3. [DONE] OD-Erkennung erweitert (mehr Indikatoren + strukturelle Erkennung)
+   Datei: scanners/directory.go (IsDirectoryListing)
+   Fix (umgesetzt):
+   - Neue Strong-Indikatoren: `[to parent directory]` (IIS).
+   - Neue Weak-Indikatoren: `lighttpd/`, `last modified`.
+   - Early bail-out in strict entfernt — HTML-Struktur wird immer analysiert.
+   - Neuer `looksLikeFile()` Helper zaehlt Links mit Dateiendung.
+   - Strukturelle Erkennung (beide Modi): Parent-Link + >10 File-Extension-Links → true.
+
+4. [DONE] `strict` analysiert jetzt auch Struktur ohne Text-Marker
+   Datei: scanners/directory.go (IsDirectoryListing)
+   Fix (umgesetzt):
+   - Kein fruehes `return false` mehr bei fehlendem Indicator.
+   - Strict erkennt jetzt: strong indicator ODER weak+parent+links ODER parent+>10 file-ext-links.
+
+5. [DONE] `permissive` Schwellen gesenkt, mehr Erkennungspfade
+   Datei: scanners/directory.go (IsDirectoryListing)
+   Fix (umgesetzt):
+   - <pre>/<table> + Parent-Link: Schwelle von >5 auf >2 Links gesenkt.
+   - Neuer Pfad: >10 File-Extension-Links auch ohne Parent-Link → true.
+
+6. [DONE] Default auf `permissive` geaendert
+   Datei: ressources/config.json
+   Fix (umgesetzt):
+   - `"permissive_directory_detection": true` (war: false).
+
+7. [DONE] IP->Hostname-Redirects konfigurierbar
+   Dateien: config/config.go, crawler/client.go, ressources/config.json
+   Fix (umgesetzt):
+   - Neues Config-Feld: `follow_hostname_redirects` (default: true).
+   - Wenn aktiviert: Redirects von IP-Adressen zu Hostnamen werden gefolgt.
+   - Cross-Host-Redirects zwischen Hostnamen bleiben weiterhin geblockt.
+
+ALLE PUNKTE ABGESCHLOSSEN.
+
+Nachpruefung zu Punkten 3-7 (Spaeterer Review):
+
+8. [DONE] Redirect-Ketten-Bug gefixt (via[0] → via[len(via)-1])
+   Datei: crawler/client.go:57
+   Fix (umgesetzt):
+   - `via[0]` (immer erster Request) ersetzt durch `via[len(via)-1]` (vorheriger Hop).
+   - Nur der erste Cross-Host-Hop (IP→Hostname) ist erlaubt, danach same-host-only.
+   - Neuer Test: `TestCheckHostAndFetch_BlocksRedirectChain` (IP→localhost→serverB wird geblockt).
+
+9. [DONE] Tests fuer neue OD-Erkennungspfade ergaenzt
+   Datei: scanners/directory_test.go
+   Fix (umgesetzt):
+   - `TestIsDirectoryListing_IISStrongIndicator`: IIS `[To Parent Directory]` Marker.
+   - `TestIsDirectoryListing_StrictStructuralFallback`: Parent + >10 file-ext Links, keine Marker.
+   - `TestIsDirectoryListing_PermissiveNoParentManyFileLinks`: >10 file-ext Links ohne Parent
+     (permissive=true, strict=false verifiziert).
+
+ALLE PUNKTE ABGESCHLOSSEN.

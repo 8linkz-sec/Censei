@@ -40,7 +40,7 @@ func (l *Logger) SetOutputFile(fileName string) error {
 
 	// Close existing file if open
 	if l.logFile != nil {
-		l.logFile.Close()
+		_ = l.logFile.Close()
 		l.logFile = nil
 	}
 
